@@ -14,11 +14,28 @@ namespace N01D.Overwatch.Services
     /// </summary>
     public class FlightTrackingService
     {
-        private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(20) };
+        private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(25) };
 
         // Middle East bounding box: lat 12-42, lon 24-64
         private const double LatMin = 12.0, LatMax = 42.0, LonMin = 24.0, LonMax = 64.0;
         private const string OpenSkyUrl = "https://opensky-network.org/api/states/all";
+
+        // ── Caching + Rate-Limit Protection ──
+        private List<FlightData> _cachedFlights = new();
+        private DateTime _lastSuccessfulFetch = DateTime.MinValue;
+        private DateTime _lastApiCall = DateTime.MinValue;
+        private int _consecutiveFailures = 0;
+        private bool _isRateLimited = false;
+        private DateTime _rateLimitedUntil = DateTime.MinValue;
+        private const int MinPollIntervalSeconds = 15;  // Don't hit API more than once per 15s
+        private const int MaxBackoffSeconds = 300;       // Max 5-minute backoff on repeated failures
+
+        /// <summary>Status message describing last API result — for UI display.</summary>
+        public string LastStatus { get; private set; } = "Awaiting first scan...";
+        /// <summary>Whether the last call was rate-limited (429).</summary>
+        public bool IsRateLimited => _isRateLimited;
+        /// <summary>Age of cached data.</summary>
+        public TimeSpan CacheAge => _lastSuccessfulFetch == DateTime.MinValue ? TimeSpan.MaxValue : DateTime.UtcNow - _lastSuccessfulFetch;
 
         // Known military callsign prefixes — comprehensive list
         private static readonly string[] _milPrefixes = {
@@ -231,53 +248,127 @@ namespace N01D.Overwatch.Services
 
         public async Task<List<FlightData>> FetchMilitaryFlightsAsync()
         {
+            // ── Rate-limit / backoff guard ──
+            var now = DateTime.UtcNow;
+            var sinceLastCall = (now - _lastApiCall).TotalSeconds;
+
+            // Enforce minimum poll interval
+            if (sinceLastCall < MinPollIntervalSeconds)
+            {
+                LastStatus = _cachedFlights.Count > 0
+                    ? $"Using cache ({_cachedFlights.Count} aircraft, {CacheAge.TotalSeconds:N0}s old) — cooldown"
+                    : "Cooldown — waiting to poll API";
+                return _cachedFlights;
+            }
+
+            // Exponential backoff on repeated failures
+            if (_isRateLimited && now < _rateLimitedUntil)
+            {
+                var wait = (_rateLimitedUntil - now).TotalSeconds;
+                LastStatus = _cachedFlights.Count > 0
+                    ? $"Rate-limited — using cache ({_cachedFlights.Count} aircraft, {CacheAge.TotalSeconds:N0}s old) — retry in {wait:N0}s"
+                    : $"Rate-limited — retry in {wait:N0}s";
+                return _cachedFlights;
+            }
+
+            _lastApiCall = now;
             var flights = new List<FlightData>();
+
             try
             {
-                var url = $"{OpenSkyUrl}?lamin={LatMin}&lomin={LonMin}&lamax={LatMax}&lomax={LonMax}";
-                var json = await _http.GetStringAsync(url);
-                using var doc = JsonDocument.Parse(json);
+                // Try full bounding box first
+                flights = await FetchFromOpenSkyAsync(LatMin, LonMin, LatMax, LonMax);
 
-                if (!doc.RootElement.TryGetProperty("states", out var states) || states.ValueKind != JsonValueKind.Array)
-                    return flights;
-
-                foreach (var s in states.EnumerateArray())
-                {
-                    if (s.GetArrayLength() < 17) continue;
-
-                    var icao24 = s[0].GetString() ?? "";
-                    var callsign = (s[1].GetString() ?? "").Trim();
-                    var country = s[2].GetString() ?? "";
-                    var lon = s[5].ValueKind == JsonValueKind.Number ? s[5].GetDouble() : (double?)null;
-                    var lat = s[6].ValueKind == JsonValueKind.Number ? s[6].GetDouble() : (double?)null;
-                    var alt = s[7].ValueKind == JsonValueKind.Number ? s[7].GetDouble() : 0.0;
-                    var speed = s[9].ValueKind == JsonValueKind.Number ? s[9].GetDouble() : 0.0;
-                    var heading = s[10].ValueKind == JsonValueKind.Number ? s[10].GetDouble() : 0.0;
-
-                    if (lat == null || lon == null) continue;
-
-                    bool isMil = IsMilitaryCallsign(callsign) || IsMilitaryHex(icao24) ||
-                                 IsMilitaryCountryOfInterest(country);
-
-                    if (!isMil) continue;
-
-                    flights.Add(new FlightData
-                    {
-                        Callsign = callsign,
-                        Registration = icao24,
-                        AircraftType = GuessAircraftType(callsign),
-                        Country = country,
-                        Latitude = lat.Value,
-                        Longitude = lon.Value,
-                        Altitude = alt,
-                        Speed = speed * 1.944, // m/s → knots
-                        Heading = heading,
-                        IsMilitary = true,
-                        LastSeen = DateTime.UtcNow
-                    });
-                }
+                // Success — reset failure tracking
+                _consecutiveFailures = 0;
+                _isRateLimited = false;
+                _cachedFlights = flights;
+                _lastSuccessfulFetch = DateTime.UtcNow;
+                LastStatus = $"{flights.Count} military aircraft detected (live)";
             }
-            catch { /* API may rate-limit — fail silently */ }
+            catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+            {
+                // 429 — rate limited
+                _consecutiveFailures++;
+                _isRateLimited = true;
+                var backoff = Math.Min(MinPollIntervalSeconds * Math.Pow(2, _consecutiveFailures), MaxBackoffSeconds);
+                _rateLimitedUntil = DateTime.UtcNow.AddSeconds(backoff);
+                LastStatus = _cachedFlights.Count > 0
+                    ? $"API rate-limited (429) — showing cache ({_cachedFlights.Count} aircraft, {CacheAge.TotalSeconds:N0}s old) — backoff {backoff:N0}s"
+                    : $"API rate-limited (429) — no cache yet — backoff {backoff:N0}s";
+                return _cachedFlights;
+            }
+            catch (Exception ex)
+            {
+                // Other errors (timeout, network, etc.)
+                _consecutiveFailures++;
+                if (_consecutiveFailures >= 3)
+                {
+                    var backoff = Math.Min(30 * Math.Pow(2, _consecutiveFailures - 3), MaxBackoffSeconds);
+                    _rateLimitedUntil = DateTime.UtcNow.AddSeconds(backoff);
+                    _isRateLimited = true;
+                }
+                LastStatus = _cachedFlights.Count > 0
+                    ? $"API error ({ex.Message.Split('\n')[0]}) — showing cache ({_cachedFlights.Count} aircraft)"
+                    : $"API error: {ex.Message.Split('\n')[0]}";
+                return _cachedFlights;
+            }
+
+            return flights;
+        }
+
+        /// <summary>
+        /// Raw OpenSky fetch for a specific bounding box. Throws on HTTP errors.
+        /// </summary>
+        private async Task<List<FlightData>> FetchFromOpenSkyAsync(double latMin, double lonMin, double latMax, double lonMax)
+        {
+            var flights = new List<FlightData>();
+            var url = $"{OpenSkyUrl}?lamin={latMin}&lomin={lonMin}&lamax={latMax}&lomax={lonMax}";
+
+            var response = await _http.GetAsync(url);
+            response.EnsureSuccessStatusCode();
+            var json = await response.Content.ReadAsStringAsync();
+
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("states", out var states) || states.ValueKind != JsonValueKind.Array)
+                return flights;
+
+            foreach (var s in states.EnumerateArray())
+            {
+                if (s.GetArrayLength() < 17) continue;
+
+                var icao24 = s[0].GetString() ?? "";
+                var callsign = (s[1].GetString() ?? "").Trim();
+                var country = s[2].GetString() ?? "";
+                var lon = s[5].ValueKind == JsonValueKind.Number ? s[5].GetDouble() : (double?)null;
+                var lat = s[6].ValueKind == JsonValueKind.Number ? s[6].GetDouble() : (double?)null;
+                var alt = s[7].ValueKind == JsonValueKind.Number ? s[7].GetDouble() : 0.0;
+                var speed = s[9].ValueKind == JsonValueKind.Number ? s[9].GetDouble() : 0.0;
+                var heading = s[10].ValueKind == JsonValueKind.Number ? s[10].GetDouble() : 0.0;
+
+                if (lat == null || lon == null) continue;
+
+                bool isMil = IsMilitaryCallsign(callsign) || IsMilitaryHex(icao24) ||
+                             IsMilitaryCountryOfInterest(country);
+
+                if (!isMil) continue;
+
+                flights.Add(new FlightData
+                {
+                    Callsign = callsign,
+                    Registration = icao24,
+                    AircraftType = GuessAircraftType(callsign),
+                    Country = country,
+                    Latitude = lat.Value,
+                    Longitude = lon.Value,
+                    Altitude = alt,
+                    Speed = speed * 1.944, // m/s → knots
+                    Heading = heading,
+                    IsMilitary = true,
+                    LastSeen = DateTime.UtcNow
+                });
+            }
+
             return flights;
         }
 

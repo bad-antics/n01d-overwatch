@@ -129,7 +129,11 @@ namespace N01D.Overwatch
                 _lastFlights = flights;
                 _lastFlightScan = DateTime.UtcNow;
                 dgFlights.ItemsSource = flights;
-                txtFlightCount.Text = $"{flights.Count} military aircraft detected";
+                txtFlightCount.Text = _flights.IsRateLimited && flights.Count > 0
+                    ? $"{flights.Count} aircraft (cached — API rate-limited)"
+                    : _flights.IsRateLimited
+                    ? "API rate-limited — waiting for cooldown"
+                    : $"{flights.Count} military aircraft detected";
                 _allEvents.RemoveAll(e2 => e2.DataSource == DataSource.FlightTracker);
                 foreach (var f in flights)
                 {
@@ -230,7 +234,12 @@ namespace N01D.Overwatch
             {
                 var flights = await _flights.FetchMilitaryFlightsAsync();
                 dgFlights.ItemsSource = flights;
-                txtFlightCount.Text = $"{flights.Count} military aircraft detected";
+                var flightLabel = _flights.IsRateLimited && flights.Count > 0
+                    ? $"{flights.Count} aircraft (cached — rate-limited)"
+                    : _flights.IsRateLimited
+                    ? "API rate-limited — waiting for cooldown"
+                    : $"{flights.Count} military aircraft detected";
+                txtFlightCount.Text = flightLabel;
 
                 // Add to timeline
                 _allEvents.RemoveAll(e2 => e2.DataSource == DataSource.FlightTracker);
@@ -1981,13 +1990,13 @@ namespace N01D.Overwatch
 
             if (_liveTrackingEnabled)
             {
-                _liveTrackingTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
+                _liveTrackingTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(60) };
                 _liveTrackingTimer.Tick += async (_, _) => await LiveTrackingPollAsync();
                 _liveTrackingTimer.Start();
                 txtLiveStatus.Text = "● LIVE";
                 txtLiveStatus.Foreground = new SolidColorBrush(Color.FromRgb(0x33, 0xCC, 0x33));
                 btnLiveTracking.Content = "⏹ STOP LIVE";
-                txtStatus.Text = "🔴 LIVE tracking enabled — polling flights every 30s";
+                txtStatus.Text = "🔴 LIVE tracking enabled — polling flights every 60s";
                 _ = LiveTrackingPollAsync(); // Immediate first poll
             }
             else
@@ -2014,7 +2023,12 @@ namespace N01D.Overwatch
                 Dispatcher.Invoke(() =>
                 {
                     dgFlights.ItemsSource = flights;
-                    txtFlightCount.Text = $"{flights.Count} aircraft | Scan #{_liveTrackingCycles}";
+                    var label = _flights.IsRateLimited && flights.Count > 0
+                        ? $"{flights.Count} aircraft (cached) | Scan #{_liveTrackingCycles}"
+                        : _flights.IsRateLimited
+                        ? $"Rate-limited — cooldown | Scan #{_liveTrackingCycles}"
+                        : $"{flights.Count} aircraft | Scan #{_liveTrackingCycles}";
+                    txtFlightCount.Text = label;
                     UpdateMapFlights(flights);
 
                     // Update flight events in timeline
